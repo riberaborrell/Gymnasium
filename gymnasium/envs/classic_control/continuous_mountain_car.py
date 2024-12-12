@@ -114,7 +114,8 @@ class Continuous_MountainCarEnv(gym.Env):
         "render_fps": 30,
     }
 
-    def __init__(self, render_mode: Optional[str] = None, goal_velocity=0, is_vectorized=False):
+    def __init__(self, render_mode: Optional[str] = None, goal_velocity=0, terminal_reward=0.,
+                 running_cost=1., is_vectorized=False):
         self.min_action = -1.0
         self.max_action = 1.0
         self.min_position = -1.2
@@ -125,6 +126,8 @@ class Continuous_MountainCarEnv(gym.Env):
         )
         self.goal_velocity = goal_velocity
         self.power = 0.0015
+        self.terminal_reward = terminal_reward
+        self.running_cost = running_cost
 
         self.low_state = np.array(
             [self.min_position, -self.max_speed], dtype=np.float32
@@ -182,8 +185,8 @@ class Continuous_MountainCarEnv(gym.Env):
 
         reward = 0
         if terminated:
-            reward = 100.0
-        reward -= math.pow(action[0], 2) * 0.1
+            reward = self.terminal_reward
+        reward -= self.running_cost + math.pow(action[0], 2) * 0.1
 
         self.state = np.array([position, velocity], dtype=np.float32)
 
@@ -210,8 +213,8 @@ class Continuous_MountainCarEnv(gym.Env):
 
         rewards = np.zeros(self.batch_size, dtype=np.float32)
         if terminated.any():
-            rewards[terminated] = 100.0
-        rewards -= np.power(actions, 2) * 0.1
+            rewards[terminated] = self.terminal_reward
+        rewards -= self.running_cost + np.power(actions, 2) * 0.1
 
         self.state = np.stack([positions, velocities], dtype=np.float32).T
 
