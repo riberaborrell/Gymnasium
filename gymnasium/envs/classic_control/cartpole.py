@@ -13,7 +13,7 @@ import gymnasium as gym
 from gymnasium import logger, spaces
 from gymnasium.envs.classic_control import utils
 from gymnasium.error import DependencyNotInstalled
-from gymnasium.vector import AutoresetMode, VectorEnv
+from gymnasium.vector import VectorEnv
 from gymnasium.vector.utils import batch_space
 
 
@@ -116,9 +116,8 @@ class CartPoleEnv(gym.Env[np.ndarray, Union[int, np.ndarray]]):
         "render_fps": 50,
     }
 
-    def __init__(
-        self, sutton_barto_reward: bool = False, render_mode: Optional[str] = None
-    ):
+    def __init__(self, sutton_barto_reward: bool = False,
+                 render_mode: Optional[str] = None, is_vectorized=False):
         self._sutton_barto_reward = sutton_barto_reward
 
         self.gravity = 9.8
@@ -146,9 +145,11 @@ class CartPoleEnv(gym.Env[np.ndarray, Union[int, np.ndarray]]):
             ],
             dtype=np.float32,
         )
-
         self.action_space = spaces.Discrete(2)
         self.observation_space = spaces.Box(-high, high, dtype=np.float32)
+
+        # flag to check if the environment is custom vectorized
+        self.is_vectorized = is_vectorized
 
         self.render_mode = render_mode
 
@@ -161,7 +162,13 @@ class CartPoleEnv(gym.Env[np.ndarray, Union[int, np.ndarray]]):
 
         self.steps_beyond_terminated = None
 
-    def step(self, action):
+    def step(self, action: np.ndarray):
+        if not self.is_vectorized:
+            return self.step_orig(action)
+        else:
+            return self.step_vect(action)
+
+    def step_orig(self, action: int):
         assert self.action_space.contains(
             action
         ), f"{action!r} ({type(action)}) invalid"
@@ -225,6 +232,60 @@ class CartPoleEnv(gym.Env[np.ndarray, Union[int, np.ndarray]]):
         # truncation=False as the time limit is handled by the `TimeLimit` wrapper added during `make`
         return np.array(self.state, dtype=np.float32), reward, terminated, False, {}
 
+    def step_vect(self, action: np.ndarray):
+        assert self.action_space_vect.contains(
+            action
+        ), f"{action!r} ({type(action)}) invalid"
+        assert self.state is not None, "Call reset before using step method."
+
+        x = self.state[:, 0]
+        x_dot = self.state[:, 1]
+        theta = self.state[:, 2]
+        theta_dot = self.state[:, 3]
+        force = np.where(action == 1, self.force_mag, -self.force_mag)
+        costheta = np.cos(theta)
+        sintheta = np.sin(theta)
+
+        # For the interested reader:
+        # https://coneural.org/florian/papers/05_cart_pole.pdf
+        temp = (
+            force + self.polemass_length * np.square(theta_dot) * sintheta
+        ) / self.total_mass
+        thetaacc = (self.gravity * sintheta - costheta * temp) / (
+            self.length
+            * (4.0 / 3.0 - self.masspole * np.square(costheta) / self.total_mass)
+        )
+        xacc = temp - self.polemass_length * thetaacc * costheta / self.total_mass
+
+        if self.kinematics_integrator == "euler":
+            x = x + self.tau * x_dot
+            x_dot = x_dot + self.tau * xacc
+            theta = theta + self.tau * theta_dot
+            theta_dot = theta_dot + self.tau * thetaacc
+        else:  # semi-implicit euler
+            x_dot = x_dot + self.tau * xacc
+            x = x + self.tau * x_dot
+            theta_dot = theta_dot + self.tau * thetaacc
+            theta = theta + self.tau * theta_dot
+
+        self.state = np.stack([x, x_dot, theta, theta_dot], dtype=np.float64).T
+
+        terminated = (x < -self.x_threshold) | \
+                     (x > self.x_threshold) | \
+                     (theta < -self.theta_threshold_radians) | \
+                     (theta > self.theta_threshold_radians)
+
+        if self._sutton_barto_reward:
+            reward = np.where(~terminated, 0.0, -1.0)
+        else:
+            reward = np.where(~terminated, 1.0, 1.0)
+
+        if self.render_mode == "human":
+            self.render()
+
+        # truncation=False as the time limit is handled by the `TimeLimit` wrapper added during `make`
+        return self.state, reward, terminated, False, {}
+
     def reset(
         self,
         *,
@@ -232,12 +293,30 @@ class CartPoleEnv(gym.Env[np.ndarray, Union[int, np.ndarray]]):
         options: Optional[dict] = None,
     ):
         super().reset(seed=seed)
+
+        if self.is_vectorized:
+            assert 'batch_size' in options, "batch size key must be provided in options for custom vectorized environment."
+            self.batch_size = options['batch_size']
+
         # Note that if you use custom reset bounds, it may lead to out-of-bound
         # state/observations.
         low, high = utils.maybe_parse_reset_bounds(
             options, -0.05, 0.05  # default low
         )  # default high
-        self.state = self.np_random.uniform(low=low, high=high, size=(4,))
+
+        # original reset
+        if not self.is_vectorized:
+            self.state = self.np_random.uniform(low=low, high=high, size=(4,))
+
+        # vectorized reset
+        else:
+            # vectorize observation and action spaces
+            self.observation_space_vect = gym.vector.utils.batch_space(self.observation_space, n=self.batch_size)
+            self.action_space_vect = gym.vector.utils.batch_space(self.action_space, n=self.batch_size)
+
+            # reset state
+            self.state = self.np_random.uniform(low=low, high=high, size=(self.batch_size, 4))
+
         self.steps_beyond_terminated = None
 
         if self.render_mode == "human":
@@ -355,7 +434,6 @@ class CartPoleVectorEnv(VectorEnv):
     metadata = {
         "render_modes": ["rgb_array"],
         "render_fps": 50,
-        "autoreset_mode": AutoresetMode.NEXT_STEP,
     }
 
     def __init__(

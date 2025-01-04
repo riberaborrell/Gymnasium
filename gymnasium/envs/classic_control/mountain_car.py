@@ -106,7 +106,7 @@ class MountainCarEnv(gym.Env):
         "render_fps": 30,
     }
 
-    def __init__(self, render_mode: Optional[str] = None, goal_velocity=0):
+    def __init__(self, render_mode: Optional[str] = None, goal_velocity=0, is_vectorized=False):
         self.min_position = -1.2
         self.max_position = 0.6
         self.max_speed = 0.07
@@ -119,6 +119,9 @@ class MountainCarEnv(gym.Env):
         self.low = np.array([self.min_position, -self.max_speed], dtype=np.float32)
         self.high = np.array([self.max_position, self.max_speed], dtype=np.float32)
 
+        # flag to check if the environment is custom vectorized
+        self.is_vectorized = is_vectorized
+
         self.render_mode = render_mode
 
         self.screen_width = 600
@@ -130,11 +133,16 @@ class MountainCarEnv(gym.Env):
         self.action_space = spaces.Discrete(3)
         self.observation_space = spaces.Box(self.low, self.high, dtype=np.float32)
 
-    def step(self, action: int):
+    def step(self, action):
+        if not self.is_vectorized:
+            return self.step_orig(action)
+        else:
+            return self.step_vect(action)
+
+    def step_orig(self, action: int):
         assert self.action_space.contains(
             action
         ), f"{action!r} ({type(action)}) invalid"
-
         position, velocity = self.state
         velocity += (action - 1) * self.force + math.cos(3 * position) * (-self.gravity)
         velocity = np.clip(velocity, -self.max_speed, self.max_speed)
@@ -154,6 +162,32 @@ class MountainCarEnv(gym.Env):
         # truncation=False as the time limit is handled by the `TimeLimit` wrapper added during `make`
         return np.array(self.state, dtype=np.float32), reward, terminated, False, {}
 
+    def step_vect(self, actions: np.ndarray):
+        assert self.action_space_vect.contains(
+            actions
+        ), f"{action!r} ({type(action)}) invalid"
+        positions = self.state[:, 0]
+        velocities = self.state[:, 1]
+        velocities += (actions - 1) * self.force + np.cos(3 * positions) * (-self.gravity)
+        velocities = np.clip(velocities, -self.max_speed, self.max_speed)
+        positions += velocities
+        positions = np.clip(positions, self.min_position, self.max_position)
+
+        idx = np.where((positions == self.min_position) & (velocities < 0))[0]
+        if idx.size > 0:
+            velocities[idx] = 0
+
+        terminated = (positions >= self.goal_position) & (velocities >= self.goal_velocity)
+        rewards = - np.ones(self.batch_size, dtype=np.float32)
+
+        self.state = np.stack([positions, velocities], dtype=np.float32).T
+
+        if self.render_mode == "human":
+            self.render()
+        # truncation=False as the time limit is handled by the `TimeLimit` wrapper added during `make`
+        return self.state, rewards, terminated, False, {}
+
+
     def reset(
         self,
         *,
@@ -161,10 +195,29 @@ class MountainCarEnv(gym.Env):
         options: Optional[dict] = None,
     ):
         super().reset(seed=seed)
+
+        if self.is_vectorized:
+            assert 'batch_size' in options, "batch size key must be provided in options for custom vectorized environment."
+            self.batch_size = options['batch_size']
+
         # Note that if you use custom reset bounds, it may lead to out-of-bound
         # state/observations.
         low, high = utils.maybe_parse_reset_bounds(options, -0.6, -0.4)
-        self.state = np.array([self.np_random.uniform(low=low, high=high), 0])
+
+        # original reset
+        if not self.is_vectorized:
+            self.state = np.array([self.np_random.uniform(low=low, high=high), 0])
+
+        # vectorized reset
+        else:
+            # vectorize observation and action spaces
+            self.observation_space_vect = gym.vector.utils.batch_space(self.observation_space, n=self.batch_size)
+            self.action_space_vect = gym.vector.utils.batch_space(self.action_space, n=self.batch_size)
+
+            # reset state
+            positions = self.np_random.uniform(low=low, high=high, size=(self.batch_size, 1))
+            velocities = np.zeros((self.batch_size, 1))
+            self.state = np.hstack((positions, velocities))
 
         if self.render_mode == "human":
             self.render()
